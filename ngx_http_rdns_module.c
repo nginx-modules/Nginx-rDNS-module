@@ -1,7 +1,25 @@
+/*
+ * Copyright (C) 2012-2013 Dmitry Stolyarov
+ * Copyright (C) 2012-2013 Timofey Kirillov
+ * Copyright (C) 2012-2013 CJSC Flant (flant.com)
+ */
 
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
+
+
+/*********************************
+ *** Nginx core resolver notes ***
+ *********************************
+ * 1 cache record takes ~ 150 bytes.
+ * Cache maximum expired time is always 30 s.
+ * Cache minimum expired time taken from:
+ *   1. valid if valid resolver option set;
+ *   2. TTL from DNS answer.
+ * Cache cleared by 2 records in the end of every query.
+ */
+
 
 typedef struct {
     ngx_flag_t enabled;
@@ -123,32 +141,32 @@ static ngx_command_t  ngx_http_rdns_commands[] = {
 
 
 static ngx_http_module_t  ngx_http_rdns_module_ctx = {
-    preconfig, 
-    postconfig,   
+    preconfig,         /* pre-configuration */
+    postconfig,        /* post-configuration */
 
-    NULL,     
-    NULL,
+    NULL,              /* create main configuration */
+    NULL,              /* init main configuration */
 
-    NULL, 
-    NULL,  
+    NULL,              /* create server configuration */
+    NULL,              /* merge server configuration */
 
-    create_loc_conf,
-    merge_loc_conf
+    create_loc_conf,   /* create location configuration */
+    merge_loc_conf     /* merge location configuration */
 };
 
 
 ngx_module_t  ngx_http_rdns_module = {
     NGX_MODULE_V1,
-    &ngx_http_rdns_module_ctx,    
-    ngx_http_rdns_commands,
-    NGX_HTTP_MODULE,    
-    NULL,      
-    NULL,              
-    NULL,             
-    NULL,                   
-    NULL,               
-    NULL,             
-    NULL,               
+    &ngx_http_rdns_module_ctx,        /* module context */
+    ngx_http_rdns_commands,           /* module directives */
+    NGX_HTTP_MODULE,                  /* module type */
+    NULL,                             /* init master */
+    NULL,                             /* init module */
+    NULL,                             /* init process */
+    NULL,                             /* init thread */
+    NULL,                             /* exit thread */
+    NULL,                             /* exit process */
+    NULL,                             /* exit master */
     NGX_MODULE_V1_PADDING
 };
 
@@ -236,6 +254,10 @@ static ngx_int_t postconfig(ngx_conf_t * cf) {
         return NGX_ERROR;
     }
 
+    /* Enable code running on REWRITE phase.
+     * Enable code should run before rdns phase_handler.
+     * So, we add phase_handler as the last handler in REWRITE phase.
+     */
     for (i = arr->nelts - 1; i > 0; --i) {
         *((ngx_http_handler_pt *)arr->elts + i) = *((ngx_http_handler_pt *)arr->elts + i - 1);
     }
@@ -258,6 +280,12 @@ static ngx_int_t postconfig(ngx_conf_t * cf) {
 }
 
 
+/*
+ * Module enable directive. Directive may be in any context.
+ * In main, server and location contexts it statically enables module.
+ * In 'server if' and 'location if' contexts module works through rewrite module codes
+ *     by adding own code ngx_http_rdns_enable_code_t.
+ */
 static char * rdns_directive(ngx_conf_t * cf, ngx_command_t * cmd, void * conf) {
     ngx_http_rdns_loc_conf_t * loc_conf = conf;
     ngx_str_t * value;
@@ -297,6 +325,10 @@ static char * rdns_directive(ngx_conf_t * cf, ngx_command_t * cmd, void * conf) 
         ngx_http_rdns_enable_code_t * code;
         void * rewrite_lcf;
 
+        /*
+         * Enable code used to determine enabled state in runtime (when processing request).
+         * Enable code should run only in case directive is used inside 'if'.
+         */
 
         ngx_conf_log_error(NGX_LOG_DEBUG, cf, 0, "setup enable code");
         rewrite_lcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_rewrite_module);
@@ -318,6 +350,7 @@ static char * rdns_directive(ngx_conf_t * cf, ngx_command_t * cmd, void * conf) 
         code->conf = cconf;
         loc_conf->conf = cconf;
     } else {
+        /* statically enable module otherwise */
 #endif
         loc_conf->conf = cconf;
 #ifndef NGX_RDNS_NO_IF
@@ -419,6 +452,7 @@ static ngx_int_t resolver_handler(ngx_http_request_t * r) {
     ngx_http_rdns_common_conf_t * cconf;
 
     if (loc_cf == NULL) {
+        /* isn't possible, but who knows... */
         return NGX_DECLINED;
     }
 
@@ -436,6 +470,7 @@ static ngx_int_t resolver_handler(ngx_http_request_t * r) {
                     "rdns: resolver handler: already resolved");
             return NGX_DECLINED;
         } else if (ctx == NULL) {
+            /* Context needed because of ctx->resolved flag */
             ctx = create_context(r);
             if (ctx == NULL) {
                 ngx_log_debug0(NGX_LOG_ERR, r->connection->log, 0,
@@ -499,6 +534,7 @@ static ngx_int_t access_handler(ngx_http_request_t * r) {
     ngx_http_rdns_common_conf_t * cconf;
 
     if (loc_cf == NULL) {
+        /* isn't possible, but who knows... */
         return NGX_OK;
     }
 
@@ -749,6 +785,10 @@ static void resolver_handler_finalize(ngx_http_request_t * r, ngx_http_rdns_ctx_
 
     ctx->resolved = 1;
 
+    /*
+     * Reset request handling pipeline to make new variable 'rdns_result'
+     *  visible by other rewrite phase modules
+     */
     r->uri_changed = 1;
 
     ngx_http_finalize_request(r, NGX_DECLINED);
@@ -848,6 +888,12 @@ static void enable_code(ngx_http_script_engine_t * e) {
 #endif
 
 
+/*
+ * Module check enabled state as follows:
+ *  1. Check existence of request context.
+ *  2. If it exists - take enable from 'conf source';
+ *      otherwise - take enable from location config.
+ */
 static ngx_http_rdns_common_conf_t * rdns_get_common_conf(ngx_http_rdns_ctx_t * ctx, ngx_http_rdns_loc_conf_t * loc_cf) {
     if (loc_cf == NULL) {
         return NULL;
